@@ -1,0 +1,7 @@
+module VLCBridging [system] {
+    module LibVLC {
+        header "libvlc_bridging.h"
+        link "libvlc"
+        export *
+    }
+}

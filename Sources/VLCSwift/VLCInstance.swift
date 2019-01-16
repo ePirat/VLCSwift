@@ -1,14 +1,19 @@
+import Foundation
 import VLCBridging
-
 
 public typealias VLCTime = VLCBridging.libvlc_time_t
 
 /** Opaque structure that represent a libvlc instance */
 typealias CLibVLCInstance = OpaquePointer
 
+/** Opaque structure that contains libvlc log message metdata */
+typealias CLibVLCLog = OpaquePointer
+
 
 public class VLCInstance {
     let cLibVLCPtr: CLibVLCInstance
+
+    // MARK: - Initialization
 
     /**
      * Create a new VLCInstance with a `CLibVLCInstance` pointer.
@@ -16,6 +21,10 @@ public class VLCInstance {
     init?(cPtr: CLibVLCInstance?) {
         guard let cPtr = cPtr else { return nil }
         self.cLibVLCPtr = cPtr
+
+        // Logging
+        self.logCallback = nil
+        self.cLogFile = nil
     }
 
     /**
@@ -87,7 +96,115 @@ public class VLCInstance {
 
     deinit {
         libvlc_release(cLibVLCPtr)
+
+        if self.cLogFile != nil {
+            fclose(self.cLogFile)
+        }
     }
+
+    // MARK: - Logging
+
+    /* Queue to serialize changes of the logging methods */
+    private var logCallbackQueue = DispatchQueue(label: "logcallback")
+
+    /* The "external" log callback closure */
+    private var logCallback: ((String?) -> ())?
+
+    /* Log file */
+    private var cLogFile: UnsafeMutablePointer<FILE>?
+
+    /* Register the internal log callback
+     * The internal logging callback takes care of abstracting the C
+     * specifics of the callback away, formats the final message and
+     * calls the Swift log callback closure with the message and log
+     * message information context.
+     */
+    private func registerInternalLogCallback() {
+        let voidSelf = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+
+        libvlc_log_set(cLibVLCPtr, { (data, log_level, context, message, args) in
+
+            // Format message
+            var msgptr: UnsafeMutablePointer<Int8>?
+            if vasprintf(&msgptr, message, args) == -1 {
+                return
+            }
+
+            // Get self
+            let mySelf = Unmanaged<VLCInstance>.fromOpaque(data!).takeUnretainedValue()
+
+            if let msg = msgptr {
+                let finalMsg = String.init(cString: msg)
+                if let cb = mySelf.logCallback {
+                    cb(finalMsg)
+                }
+            } else {
+                if let cb = mySelf.logCallback {
+                    cb(nil)
+                }
+            }
+        }, voidSelf)
+    }
+
+    /* Unregisters a previously registered internal log callback */
+    private func unregisterInternalLogCallback() {
+        libvlc_log_unset(cLibVLCPtr)
+    }
+
+    public func setLog(callback: ((String?) -> ())? ) {
+        logCallbackQueue.sync {
+            // If no log callback was set yet, the internal
+            // log handler needs to be registered first
+            if self.logCallback == nil {
+                registerInternalLogCallback()
+            }
+
+            // If the callback is set to nil, unregister the internal callback too
+            if (callback == nil) {
+                unregisterInternalLogCallback()
+            }
+
+            self.logCallback = callback
+        }
+    }
+
+    public func setLog(fileURL: URL?) -> Bool {
+        return logCallbackQueue.sync {
+            // Unregister any log callback
+            if self.logCallback != nil {
+                unregisterInternalLogCallback()
+                self.logCallback = nil
+            }
+
+            guard let fileURL = fileURL else {
+                unregisterInternalLogCallback()
+                self.cLogFile = nil
+                return true
+            }
+
+            // Ensure it is actually a file URL
+            if !fileURL.isFileURL {
+                return false
+            }
+
+            // Open file
+            guard let cFile = fopen(fileURL.path, "a") else {
+                return false
+            }
+
+            libvlc_log_set_file(cLibVLCPtr, cFile)
+
+            // If there was a previous log file, close it first
+            if self.cLogFile != nil {
+                fclose(self.cLogFile)
+            }
+
+            self.cLogFile = cFile
+            return true
+        }
+    }
+
+    // MARK: - User-Agent settings
 
     public func setUserAgent(name: String, http: String) {
         libvlc_set_user_agent(cLibVLCPtr, name, http)
@@ -96,6 +213,8 @@ public class VLCInstance {
     public func setAppId(id: String, version: String, icon: String) {
         libvlc_set_app_id(cLibVLCPtr, id, version, icon)
     }
+
+    // MARK: - Library properties
 
     public static var version: String {
         return String.init(cString: libvlc_get_version())
